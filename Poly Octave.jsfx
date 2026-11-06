@@ -1,0 +1,194 @@
+desc:Poly Octave (POG-style polyphonic octaves)
+//tags: guitar octave polyphonic pog
+//author: Claude
+//
+// Polyphonic octave generator for guitar. The signal is split into 31 bands
+// (complex resonators). In each band the octave is made mathematically:
+// -1 oct = square root of the band's analytic signal (with phase continuity),
+// -2 oct = square root again, +1 oct = squared. Each band carries one partial,
+// so chords shift as chords.
+// No lookahead and no reported latency; the band filters need roughly
+// 5-15 ms to respond (slowest on the lowest notes). "Response" trades
+// speed against chord separation.
+
+slider1:0<-12,24,0.1>Input Gain (dB)
+slider2:-60<-90,-20,1>Gate Threshold (dB)
+slider3:0<-60,6,0.1>Dry Guitar (dB)
+slider4:0<-60,6,0.1>-1 Octave (dB)
+slider5:-60<-60,6,0.1>-2 Octaves (dB)
+slider6:-60<-60,6,0.1>+1 Octave (dB)
+slider7:6000<300,12000,1>Tone (octave voices low-pass, Hz)
+slider8:0<0,1,0.01>Drive (octave voices)
+slider9:30<15,80,1>Response (low-band width Hz: higher = faster, lower = cleaner chords)
+slider10:0<-24,12,0.1>Output (dB)
+slider11:0<0,4,1{Custom (keep settings),POG Organ,Bass Chords,12-String Shimmer,Fuzz Octaves}>Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+ext_noinit = 1;
+
+function db2g(db) ( db <= -59.9 ? 0 : pow(10, db / 20); );
+function sc(x) ( x / (1 + abs(x)); );
+
+function svf_set(fc, k) instance(a1, a2, a3) local(g) (
+  g = tan($pi * max(10, min(fc, srate * 0.45)) / srate);
+  a1 = 1 / (1 + g * (g + k));
+  a2 = g * a1;
+  a3 = g * a2;
+);
+function svf_lp(x) instance(ic1, ic2, a1, a2, a3) local(v1, v2, v3) (
+  v3 = x - ic2;
+  v1 = a1 * ic1 + a2 * v3;
+  v2 = ic2 + a2 * ic1 + a3 * v3;
+  ic1 = 2 * v1 - ic1;
+  ic2 = 2 * v2 - ic2;
+  v2;
+);
+
+// ---------- memory layout (64 slots per array) ----------
+fca  = 0;     // band centre frequencies
+polr = 64;    // pole real
+poli = 128;   // pole imag
+gn   = 192;   // input gain per band
+s1r  = 256;   s1i = 320;   // resonator stage 1 state
+s2r  = 384;   s2i = 448;   // resonator stage 2 state
+hnr  = 512;   hni = 576;   // previous -1 oct phasor (continuity)
+qnr  = 640;   qni = 704;   // previous -2 oct phasor (continuity)
+pbase = 1024;              // preset table
+NPV = 10;                  // values per preset (sliders 1-10)
+
+memset(0, 0, 1024);
+i = 0;
+loop(64, hnr[i] = 1; qnr[i] = 1; i += 1;);
+
+// band centres: 30 Hz steps up to 250 Hz, then 1/6 octave up to 4 kHz
+step = 2 ^ (1 / 6);
+f = 60;
+nbands = 0;
+while ( fca[nbands] = f; nbands += 1; f += 30; f < 250 );
+while ( fca[nbands] = f; nbands += 1; f *= step; f < 4000 );
+
+// ---------- presets ----------
+function pv(v) ( pbase[pp] = v; pp += 1; );
+pp = 0;
+// order: in, gate, dry, -1, -2, +1, tone, drive, response, out
+// 1 POG Organ
+pv(0);pv(-60);pv(0);pv(-2);pv(-8);pv(-6);pv(6000);pv(0);pv(30);pv(-3);
+// 2 Bass Chords
+pv(0);pv(-60);pv(-60);pv(0);pv(-4);pv(-60);pv(1500);pv(0.2);pv(30);pv(0);
+// 3 12-String Shimmer
+pv(0);pv(-60);pv(0);pv(-60);pv(-60);pv(-4);pv(8000);pv(0);pv(30);pv(-2);
+// 4 Fuzz Octaves
+pv(0);pv(-60);pv(-6);pv(0);pv(-60);pv(-60);pv(2500);pv(0.8);pv(30);pv(-8);
+
+firstslider = 1;
+
+tl.ic1 = tl.ic2 = 0;
+env = gate = 0;
+atkc   = 1 - exp(-1 / (0.0005 * srate));
+relc   = 1 - exp(-1 / (0.1 * srate));
+gopen  = 1 - exp(-1 / (0.002 * srate));
+gclose = 1 - exp(-1 / (0.05 * srate));
+
+@slider
+// ---------- preset selector: applies only when changed ----------
+firstslider ? (
+  lastp = slider11;
+  firstslider = 0;
+) : (
+  slider11 != lastp ? (
+    lastp = slider11;
+    slider11 >= 1 ? (
+      pb = pbase + (slider11 - 1) * NPV;
+      slider1 = pb[0]; slider2 = pb[1]; slider3 = pb[2]; slider4 = pb[3];
+      slider5 = pb[4]; slider6 = pb[5]; slider7 = pb[6]; slider8 = pb[7];
+      slider9 = pb[8]; slider10 = pb[9];
+      sliderchange(slider1); sliderchange(slider2); sliderchange(slider3);
+      sliderchange(slider4); sliderchange(slider5); sliderchange(slider6);
+      sliderchange(slider7); sliderchange(slider8); sliderchange(slider9);
+      sliderchange(slider10);
+    );
+  );
+);
+
+ingain = pow(10, slider1 / 20);
+gthr   = pow(10, slider2 / 20);
+gdry   = db2g(slider3);
+gd1    = db2g(slider4);
+gd2    = db2g(slider5);
+gu1    = db2g(slider6);
+tl.svf_set(slider7, 1.414);
+dg     = 1 + slider8 * 30;
+outg   = pow(10, slider10 / 20);
+
+// band coefficients: bandwidth ~1/6 octave, but never narrower than Response
+i = 0;
+loop(nbands,
+  bw = max(fca[i] * (step - 1), slider9);
+  rr = exp(-$pi * bw / srate);
+  ww = 2 * $pi * fca[i] / srate;
+  polr[i] = rr * cos(ww);
+  poli[i] = rr * sin(ww);
+  gn[i] = 1 - rr;
+  i += 1;
+);
+
+@sample
+x = (spl0 + spl1) * 0.5 * ingain;
+
+// gate
+ax = abs(x);
+env += (ax - env) * (ax > env ? atkc : relc);
+gt = env > gthr ? 1 : 0;
+gate += (gt - gate) * (gt > gate ? gopen : gclose);
+
+sd1 = sd2 = su1 = 0;
+k = 0;
+loop(nbands,
+  pr = polr[k]; pim = poli[k]; g = gn[k];
+  // stage 1: z1 = g*x + p*z1
+  ar = s1r[k]; ai = s1i[k];
+  z1r = g * x + pr * ar - pim * ai;
+  z1i = pr * ai + pim * ar;
+  s1r[k] = z1r; s1i[k] = z1i;
+  // stage 2: z2 = g*z1 + p*z2
+  ar = s2r[k]; ai = s2i[k];
+  zr = g * z1r + pr * ar - pim * ai;
+  zi = g * z1i + pr * ai + pim * ar;
+  s2r[k] = zr; s2i[k] = zi;
+  zr *= 2; zi *= 2;
+  m = sqrt(zr * zr + zi * zi);
+  m > 0.0000000001 ? (
+    // -1 octave: h = sqrt(z), sign chosen for phase continuity
+    hr = sqrt(max(0, (m + zr) * 0.5));
+    hi = sqrt(max(0, (m - zr) * 0.5));
+    zi < 0 ? (hi = -hi);
+    (hr * hnr[k] + hi * hni[k]) < 0 ? (hr = -hr; hi = -hi);
+    hm = sqrt(m);
+    hnr[k] = hr / hm; hni[k] = hi / hm;
+    sd1 += hr * hm;
+    // -2 octaves: q = sqrt(h)
+    qr = sqrt(max(0, (hm + hr) * 0.5));
+    qi = sqrt(max(0, (hm - hr) * 0.5));
+    hi < 0 ? (qi = -qi);
+    (qr * qnr[k] + qi * qni[k]) < 0 ? (qr = -qr; qi = -qi);
+    qm = sqrt(hm);
+    qnr[k] = qr / qm; qni[k] = qi / qm;
+    sd2 += qr * qm * qm * qm;
+    // +1 octave: Re(z^2)/|z|
+    su1 += (zr * zr - zi * zi) / m;
+  );
+  k += 1;
+);
+
+wet = (gd1 * sd1 + gd2 * sd2 + gu1 * su1) * gate;
+slider8 > 0 ? (wet = sc(wet * dg));
+wet = tl.svf_lp(wet);
+
+y = (wet + x * gdry) * outg;
+spl0 = y;
+spl1 = y;
